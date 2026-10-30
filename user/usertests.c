@@ -7,6 +7,7 @@
 #include "kernel/syscall.h"
 #include "kernel/memlayout.h"
 #include "kernel/riscv.h"
+#include "user/uthread.h"
 
 //
 // Tests xv6 system calls.  usertests without arguments runs them all
@@ -3152,6 +3153,313 @@ outofinodes(char *s)
   return 0;
 }
 
+enum { MAX_THREAD_NUM = 8, SPIN_CNT = 100, MAGIC = 1234 };
+int idxes[MAX_THREAD_NUM] = {0, 1, 2, 3, 4, 5, 6, 7};
+
+volatile int shared = 0;
+volatile int shared_x = 0;
+volatile int shared_y = 0;
+volatile int shared_arr[MAX_THREAD_NUM] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+struct args_pair { int x, y; };
+
+void inc_shared(int n) {
+  for (int i = 0; i < n; i++) shared++;
+}
+
+void
+worker_inc(void *arg)
+{
+  int n = *((int *)arg);
+  inc_shared(n);
+  exit(0);
+}
+
+void
+worker_args(void *arg)
+{
+  struct args_pair *p = (struct args_pair *)arg;
+  printf("worker_args: x=%d y=%d sum=%d\n", p->x, p->y, p->x + p->y);
+  shared_x = p->x;
+  shared_y = p->y;
+  exit(0);
+}
+
+// Long-lived child thread that just spins until killed.
+void
+worker_spin(void *arg)
+{
+  int idx = *((int *)arg);
+  for (int i = 0; i < SPIN_CNT; i++) {
+    // pause briefly so we yield instead of hot-looping
+    pause(1);
+  }
+  shared_arr[idx] = 1;
+  exit(0);
+}
+
+void
+worker_spin_exit_early(void *arg)
+{
+  for (int i = 0; i < SPIN_CNT / 4; i++) {
+    // pause briefly so we yield instead of hot-looping
+    pause(1);
+  }
+  exit(0);
+}
+
+void
+worker_exit_instantly(void *arg)
+{
+  exit(0);
+}
+
+int
+clone_mem_share(char *s)
+{
+  enum { TASK_CNT = 3, WORK_CNT = 100 };
+  printf("\n");
+
+  int cnt = WORK_CNT;
+  shared = 0;
+  for (int i = 0; i < TASK_CNT - 1; i++) {
+    thread_create(worker_inc, (void *)&cnt, 1);
+  }
+  inc_shared(cnt);
+
+  for (int i = 0; i < TASK_CNT - 1; i++) {
+    thread_join();
+  }
+
+  printf("shared = %d (expected 0..%d, but under than %d needs review)\n",
+    shared, TASK_CNT * WORK_CNT, (TASK_CNT - 1) * WORK_CNT);
+
+  // Without locks the count may race down; we only check that both
+  // threads observed and modified the SAME variable, so result > 0
+  // and <= 200.
+  if (shared < 0 || shared > TASK_CNT * WORK_CNT) return 1;
+  if (shared < (TASK_CNT - 1) * WORK_CNT) return 2;
+  return 0;
+}
+
+int
+clone_mem_copy(char *s)
+{
+  enum { TASK_CNT = 3, WORK_CNT = 100 };
+  printf("\n");
+
+  int cnt = WORK_CNT;
+  shared = 0;
+
+  for (int i = 0; i < TASK_CNT - 1; i++) {
+    int pid = fork();
+    if (pid == 0) {
+      inc_shared(cnt);
+      exit(0);
+    }
+  }
+  inc_shared(cnt);
+
+  for (int i = 0; i < TASK_CNT - 1; i++) {
+    wait(0);
+  }
+
+  printf("shared = %d (expected %d)\n", shared, WORK_CNT);
+
+  if (shared == WORK_CNT) return 0;
+  return 1;
+}
+
+int
+thread_args(char *s)
+{
+  printf("\n");
+  enum { X = 3, Y = 4 };
+  shared_x = 0;
+  shared_y = 0;
+
+  struct args_pair arg;
+  arg.x = X;
+  arg.y = Y;
+  thread_create(worker_args, (void *)&arg, 1);
+  thread_join();
+
+  printf("shared_x = %d, shared_y = %d (expected: shared_x = %d, shared_y = %d)",
+    shared_x, shared_y, X, Y);
+
+  if (shared_x == X && shared_y == Y) return 0;
+  return 1;
+}
+
+int
+exit_leader(char *s)
+{
+  enum { NUM_THREAD = 7, NUM_REPEAT = 20 };
+  printf("\n");
+  for (int i = 0; i < 8; i++) shared_arr[i] = 0;
+
+  for (int i = 0; i < NUM_REPEAT; i++) {
+    int pid = fork();
+    if (pid == 0) {
+      for (int j = 0; j < NUM_THREAD; j++) {
+        if (thread_create(worker_spin, (void *) (idxes + j), 1) < 0) {
+          printf("thread create failed\n");
+          exit(1);
+        }
+      }
+      // Exit without joining — leader should kill+reap all 4 threads.
+      exit(0);
+    }
+    int xstate;
+    wait(&xstate);
+    if (xstate != 0) return 1;
+  }
+  return 0;
+}
+
+int
+exit_non_leader(char *s)
+{
+  enum { NUM_THREAD = 4 };
+  printf("\n");
+  for (int i = 0; i < 8; i++) shared_arr[i] = 0;
+
+  int pid = fork();
+  if (pid == 0) {
+    for (int i = 1; i < NUM_THREAD; i++) {
+      thread_create(worker_spin, (void *) (idxes + i), 1);
+    }
+    thread_create(worker_spin_exit_early, (void *)idxes, 1);
+
+    for (int i = 0; i < NUM_THREAD; i++) thread_join();
+
+    int failed = 0;
+    printf("shared_arr: ");
+    for (int i = 0; i < NUM_THREAD; i++) {
+      printf("%d ", shared_arr[i]);
+      if (i == 0 && shared_arr[i] != 0) failed = 1;
+      if (i != 0 && shared_arr[i] != 1) failed = 1;
+    }
+    printf("\n");
+    if (failed) exit(1);
+    exit(0);
+  }
+
+  int xstate;
+  wait(&xstate);
+  if (xstate != 0) return 1;
+  return 0;
+}
+
+int
+kill_thread(char *s)
+{
+  enum { NUM_THREAD = 7, NUM_REPEAT = 20 };
+  printf("\n");
+  for (int i = 0; i < 8; i++) shared_arr[i] = 0;
+
+  for (int i = 0; i < NUM_REPEAT; i++) {
+    int pid = fork();
+    if (pid == 0) {
+      int tids[NUM_THREAD];
+      for (int j = 0; j < NUM_THREAD; j++) {
+        tids[j] = thread_create(worker_spin, (void *) (idxes + j), 1);
+        if (tids[j] < 0) exit(MAGIC);
+      }
+      pause(SPIN_CNT / 5);
+      printf("tids[0]: %d\n", tids[0]);
+      kill(tids[0]);
+
+      for (int i = 0; i < NUM_THREAD; i++) thread_join();
+      exit(MAGIC);
+    }
+
+    int xstate;
+    wait(&xstate);
+    if (xstate == MAGIC) return 1;
+  }
+  return 0;
+}
+
+int
+wait_thread(char *s)
+{
+  printf("\n");
+  int pid = fork();
+  if (pid == 0) {
+    thread_create(worker_exit_instantly, 0, 1);
+
+    pause(SPIN_CNT / 5);
+    exit(0);
+  }
+
+  uint64 start = uptime();
+  wait(0);
+  uint64 end = uptime();
+
+  printf("wait() took %d ticks\n", (int)(end - start));
+  if (end - start < 15) {
+    printf("wait() returned too early (likely returned on non-leader thread exit)\n");
+    return 1;
+  }
+  return 0;
+}
+
+int
+exec_thread(char *s)
+{
+  enum { NUM_THREAD = 7, NUM_REPEAT = 20 };
+  printf("\n");
+  for (int i = 0; i < 8; i++) shared_arr[i] = 0;
+
+  unlink("exec-test-ok");
+
+  for (int i = 0; i < NUM_REPEAT; i++) {
+    int pid = fork();
+    if (pid == 0) {
+      for (int j = 0; j < NUM_THREAD; j++) {
+        if (thread_create(worker_spin, (void *) (idxes + j), 1) < 0) {
+          printf("thread create failed\n");
+          exit(1);
+        }
+      }
+      pause(SPIN_CNT / 5);
+
+      // Redirect stdout to a file to verify exec actually ran
+      close(1);
+      int fd = open("exec-test-ok", O_CREATE|O_WRONLY);
+      if (fd != 1) exit(1);
+      char *args[] = { "echo", "OK", 0 };
+      exec("echo", args);
+
+      // Should not reach here if exec is successful
+      exit(1);
+    }
+
+    int xstate;
+    wait(&xstate);
+    if (xstate != 0) return 1;
+  }
+
+  char buf[3] = {0};
+  int fd = open("exec-test-ok", O_RDONLY);
+  if (fd < 0) {
+    printf("failed to open exec-test-ok\n");
+    return 1;
+  }
+  read(fd, buf, 2);
+  close(fd);
+  unlink("exec-test-ok");
+
+  printf("buf: %s\n", buf);
+  if (buf[0] != 'O' || buf[1] != 'K') {
+    printf("exec output mismatch\n");
+    return 1;
+  }
+
+  return 0;
+}
+
 struct test slowtests[] = {
   {bigdir, "bigdir"},
   {manywrites, "manywrites"},
@@ -3159,6 +3467,14 @@ struct test slowtests[] = {
   {execout, "execout"},
   {diskfull, "diskfull"},
   {outofinodes, "outofinodes"},
+  {clone_mem_share, "clone_mem_share"},
+  {clone_mem_copy, "clone_mem_copy"},
+  {thread_args, "thread_args"},
+  {exit_leader, "exit_leader"},
+  {exit_non_leader, "exit_non_leader"},
+  {kill_thread, "kill_thread"},
+  {wait_thread, "wait_thread"},
+  {exec_thread, "exec_thread"},
 
   { 0, 0},
 };
@@ -3166,6 +3482,26 @@ struct test slowtests[] = {
 //
 // drive tests
 //
+
+struct test essentialtests[] = {
+  {copyin, "copyin"},
+  {copyout, "copyout"},
+  {exectest, "exectest"},
+  {pipe1, "pipe1"},
+  {exitwait, "exitwait"},
+  {createtest, "createtest"},
+  {writetest, "writetest"},
+  {unlinkread, "unlinkread"},
+  {forktest, "forktest"},
+  {sbrkbasic, "sbrkbasic"},
+  {kernmem, "kernmem"},
+  {validatetest, "validatetest"},
+  {badarg, "badarg"},
+  {reparent2, "reparent2"},
+  {concreate, "concreate"},
+  {sharedfd, "sharedfd"},
+  { 0, 0},
+};
 
 // run each test in its own process. run returns the child's raw exit status:
 //   0 => test passed, 1 => test failed, any other value => unexpected / need review.
@@ -3226,15 +3562,19 @@ countfree()
 }
 
 int
-drivetests(int quick, int continuous, char *justone) {
+drivetests(int quick, int continuous, int essential, char *justone) {
   do {
     printf("usertests starting\n");
     int free0 = countfree();
     int free1 = 0;
-    int result = runtests(quicktests, justone, continuous);
+
+    struct test *target_tests = quicktests;
+    if (essential) target_tests = essentialtests;
+
+    int result = runtests(target_tests, justone, continuous);
 
     if (result > 0 && continuous != 2) return result;
-    if(!quick) {
+    if(!quick && !essential) {
       if (justone == 0)
         printf("usertests slow tests starting\n");
       int tmp_result = runtests(slowtests, justone, continuous);
@@ -3261,10 +3601,13 @@ main(int argc, char *argv[])
 {
   int continuous = 0;
   int quick = 0;
+  int essential = 0;
   char *justone = 0;
 
   if(argc == 2 && strcmp(argv[1], "-q") == 0){
     quick = 1;
+  } else if(argc == 2 && strcmp(argv[1], "-e") == 0){
+    essential = 1;
   } else if(argc == 2 && strcmp(argv[1], "-c") == 0){
     continuous = 1;
   } else if(argc == 2 && strcmp(argv[1], "-C") == 0){
@@ -3272,10 +3615,10 @@ main(int argc, char *argv[])
   } else if(argc == 2 && argv[1][0] != '-'){
     justone = argv[1];
   } else if(argc > 1){
-    printf("Usage: usertests [-c] [-C] [-q] [testname]\n");
+    printf("Usage: usertests [-c] [-C] [-q] [-e] [testname]\n");
     exit(1);
   }
-  int result = drivetests(quick, continuous, justone);
+  int result = drivetests(quick, continuous, essential, justone);
   if (result < 0) printf("NO TESTS EXECUTED\n");
   else if (result == 0) printf("PASS ALL TESTS\n");
   else if (result == 1) printf("FAIL SOME TESTS\n");
