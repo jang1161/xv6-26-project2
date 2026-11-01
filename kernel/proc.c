@@ -118,20 +118,39 @@ mm_alloc(void)
 void
 mm_get(struct mm_struct *mm)
 {
-  (void)mm;
+  acquire(&mm->lock);
+  mm->refcount++;
+  release(&mm->lock);
 }
 
 void
 mm_put(struct mm_struct *mm)
 {
-  (void)mm;
+  int lastproc = 0;
+  acquire(&mm->lock);
+  mm->refcount--;
+  if (mm->refcount == 0) lastproc = 1;
+  release(&mm->lock);
+
+  if (lastproc) {
+    proc_freepagetable(mm->pagetable, mm->sz);
+    kfree(mm);
+  }
 }
 
 uint64
 find_free_tf_va(pagetable_t pagetable)
 {
-  (void)pagetable;
-  return 0;
+  uint64 found = 0;
+  
+  for (uint64 va = TRAPFRAME; va > USERTOP; va -= PGSIZE) {
+    if (!ismapped(pagetable, va)) {
+      found = va;
+      break;
+    }
+  }
+
+  return found;
 }
 
 // Look in the process table for an UNUSED proc.
@@ -189,6 +208,9 @@ freeproc(struct proc *p)
     kfree((void *)p->trapframe);
     p->trapframe = 0;
   }
+
+  if (p->mm && p->tf_va)
+    uvmunmap(p->mm->pagetable, p->tf_va, 1, 0);
   p->tf_va = 0;
 
   if (p->mm) {
