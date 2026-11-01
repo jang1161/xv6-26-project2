@@ -13,8 +13,8 @@
 int
 thread_create(void (*fn)(void *), void *arg, int n_pages)
 {
-  (void)fn; (void)arg; (void)n_pages;
-  return -1;
+  uint64 ustack = malloc(n_pages * PGSIZE);
+  return clone(fn, arg, ustack, n_pages, CLONE_VM); // pid
 }
 
 int

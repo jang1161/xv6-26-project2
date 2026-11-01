@@ -337,9 +337,22 @@ kclone(uint64 fn, uint64 arg, uint64 stack, int n_pages, int flags)
 
   if (flags & CLONE_VM) {
     // === thread path ===
-    freeproc(np);
-    release(&np->lock);
-    return -1;
+    np->mm = p->mm;
+    mm_get(np->mm);
+    np->group_leader = p->group_leader;
+    np->tgid = np->group_leader->pid;
+
+    if ((np->tf_va = find_free_tf_va(np->mm->pagetable)) == 0)
+      goto fail;
+    
+    if(mappages(np->mm->pagetable, np->tf_va, PGSIZE, (uint64)(np->trapframe), PTE_R | PTE_W) < 0)
+      goto fail;
+    
+    np->trapframe->epc = fn;
+    np->ustack = (void *)stack;
+    np->trapframe->sp = np->ustack + n_pages * PGSIZE;
+    np->trapframe->a0 = arg;
+
   } else {
     // === fork path ===
     if ((np->mm = mm_alloc()) == 0)
