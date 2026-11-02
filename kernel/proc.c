@@ -350,7 +350,7 @@ kclone(uint64 fn, uint64 arg, uint64 stack, int n_pages, int flags)
     
     np->trapframe->epc = fn;
     np->ustack = (void *)stack;
-    np->trapframe->sp = np->ustack + n_pages * PGSIZE;
+    np->trapframe->sp = (uint64)np->ustack + n_pages * PGSIZE;
     np->trapframe->a0 = arg;
 
   } else {
@@ -401,8 +401,50 @@ fail:
 int
 kjoin(uint64 stack_addr)
 {
-  (void)stack_addr;
-  return -1;
+  struct proc *pp;
+  int havekids, pid;
+  struct proc *p = myproc();
+
+  acquire(&wait_lock);
+
+  for(;;){
+    havekids = 0;
+    for(pp = proc; pp < &proc[NPROC]; pp++){
+      if (!pp->tf_va) continue; // Is pp a thread?
+      if (pp->parent != p && !(pp != p && pp->group_leader == p)) // Is p a parent or leader?
+        continue;
+
+      // make sure the child isn't still in exit() or swtch().
+      acquire(&pp->lock);
+
+      havekids = 1;
+      if(pp->state == ZOMBIE){
+        // Found one.
+        pid = pp->pid;
+        if(stack_addr != 0 && copyout(p->mm->pagetable, stack_addr,
+                                (char *)&pp->ustack,
+                                sizeof(pp->ustack)) < 0) { // return ustack addr instead of xstate
+          release(&pp->lock);
+          release(&wait_lock);
+          return -1;
+        }
+        freeproc(pp);
+        release(&pp->lock);
+        release(&wait_lock);
+        return pid;
+      }
+      release(&pp->lock);
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havekids || killed(p)){
+      release(&wait_lock);
+      return -1;
+    }
+
+    // Wait for a child to exit.
+    sleep(p, &wait_lock);  //DOC: wait-sleep
+  }
 }
 
 // Pass p's abandoned children to init.

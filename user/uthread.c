@@ -13,12 +13,18 @@
 int
 thread_create(void (*fn)(void *), void *arg, int n_pages)
 {
-  uint64 ustack = malloc(n_pages * PGSIZE);
+  void *ustack;
+  if ((ustack = malloc(n_pages * PGSIZE)) < 0) 
+    return -1;
   return clone(fn, arg, ustack, n_pages, CLONE_VM); // pid
 }
 
 int
 thread_join(void)
 {
-  return -1;
+  void *ustack;
+  int pid;
+  if ((pid = join(&ustack)) < 0) return -1;
+  free((void *)ustack);
+  return pid;
 }
