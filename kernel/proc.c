@@ -473,6 +473,46 @@ kexit(int status)
   if(p == initproc)
     panic("init exiting");
 
+  if (p->group_leader == p) {
+    struct proc *pp;
+    acquire(&wait_lock);
+
+    for (pp = proc; pp < &proc[NPROC]; pp++) {
+      acquire(&pp->lock);
+      if (pp != p && pp->tgid == p->tgid) {
+        pp->killed = 1;
+        if (pp->state == SLEEPING)
+          pp->state = RUNNABLE;
+      }
+      release(&pp->lock);
+    }
+
+    for (;;) {
+      int remain = 0;
+
+      for (pp = proc; pp < &proc[NPROC]; pp++) {
+        acquire(&pp->lock);
+        if (pp != p && pp->tgid == p->tgid) {
+          if (pp->state == ZOMBIE)
+            freeproc(pp);
+          else {
+            remain = 1;
+            release(&pp->lock);
+            break;
+          }
+        }
+        release(&pp->lock);
+      }
+
+      if (remain)
+        sleep(p, &wait_lock);
+      else {
+        release(&wait_lock);
+        break;
+      }
+    }
+  }
+
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd]){
