@@ -35,6 +35,8 @@ kexec(char *path, char **argv)
   pagetable_t pagetable = 0, oldpagetable;
   struct proc *p = myproc();
 
+  if (p->group_leader != p) return -1;
+
   begin_op();
 
   // Open the executable file.
@@ -126,6 +128,9 @@ kexec(char *path, char **argv)
     if(*s == '/')
       last = s+1;
   safestrcpy(p->name, last, sizeof(p->name));
+
+  // Drain siblings
+  drain_siblings(p);
 
   // Commit to the user image.
   acquire(&p->mm->lock);
