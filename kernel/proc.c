@@ -742,21 +742,31 @@ int
 kkill(int pid)
 {
   struct proc *p;
+  int tgid = -1;
 
   for(p = proc; p < &proc[NPROC]; p++){
     acquire(&p->lock);
     if(p->pid == pid){
-      p->killed = 1;
-      if(p->state == SLEEPING){
-        // Wake process from sleep().
-        p->state = RUNNABLE;
-      }
+      tgid = p->tgid;
       release(&p->lock);
-      return 0;
+      break;
     }
     release(&p->lock);
   }
-  return -1;
+
+  if (tgid < 0) return -1;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->tgid == tgid) {
+      p->killed = 1;
+      if (p->state == SLEEPING)
+        p->state = RUNNABLE;
+    }
+    release(&p->lock);
+  }
+
+  return 0;
 }
 
 void
